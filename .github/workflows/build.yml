@@ -24,6 +24,20 @@ jobs:
           KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
         run: |
           echo "$KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/screenmirror.keystore"
+      - name: Verify restored keystore
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+        run: |
+          echo "=== Keystore file information ==="
+          ls -lh "$RUNNER_TEMP/screenmirror.keystore"
+          echo "=== Keystore SHA-256 ==="
+          sha256sum "$RUNNER_TEMP/screenmirror.keystore"
+          echo "=== Verifying keystore ==="
+          keytool -list \
+            -keystore "$RUNNER_TEMP/screenmirror.keystore" \
+            -storepass "$KEYSTORE_PASSWORD" \
+            -alias screenmirror
+          echo "=== Keystore verification succeeded ==="
       - name: Build Debug APK
         env:
           KEYSTORE_FILE: ${{ runner.temp }}/screenmirror.keystore
