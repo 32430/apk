@@ -37,6 +37,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 import okhttp3.MediaType;
 import okhttp3.OkHttpClient;
 import okhttp3.Request;
@@ -72,6 +73,26 @@ public class MirrorService extends Service {
             "last_stage";
     private static final String KEY_RUNNING =
             "running";
+    /*
+     * セッション状態
+     *
+     * session_active=true
+     * clean_stop=false
+     *
+     * の状態で次回Serviceが起動した場合、
+     * 前回プロセスが正常な終了処理を通らずに
+     * 終了した可能性がある。
+     */
+    private static final String KEY_SESSION_ACTIVE =
+            "session_active";
+    private static final String KEY_CLEAN_STOP =
+            "clean_stop";
+    private static final String KEY_SESSION_ID =
+            "session_id";
+    private static final String KEY_SERVER_URL =
+            "server_url";
+    private static final String KEY_ROOM =
+            "room";
     private OkHttpClient httpClient;
     private WebSocket socket;
     private PeerConnectionFactory factory;
@@ -88,64 +109,111 @@ public class MirrorService extends Service {
     @Override
     public void onCreate() {
         super.onCreate();
+        Log.i(
+                TAG,
+                "MirrorService onCreate"
+        );
         createNotificationChannel();
-        /*
-         * 前回の実行が正常終了していなかったか確認。
-         *
-         * WebRTCのネイティブクラッシュなど、
-         * Javaのtry/catchでは捕まえられないクラッシュの場合でも、
-         * 前回最後のstageを確認できるようにする。
-         */
         SharedPreferences prefs =
                 getSharedPreferences(
                         DEBUG_PREFS,
                         MODE_PRIVATE
                 );
-        boolean wasRunning =
+        /*
+         * 前回セッションが正常終了したか確認。
+         *
+         * 以前は KEY_RUNNING だけで判定していたため、
+         * WebSocketの終了やServiceの通常終了などでも
+         * 誤検出する可能性があった。
+         */
+        boolean sessionActive =
                 prefs.getBoolean(
-                        KEY_RUNNING,
+                        KEY_SESSION_ACTIVE,
                         false
+                );
+        boolean cleanStop =
+                prefs.getBoolean(
+                        KEY_CLEAN_STOP,
+                        true
                 );
         String previousStage =
                 prefs.getString(
                         KEY_STAGE,
                         "unknown"
                 );
-        if (wasRunning) {
+        String previousServerUrl =
+                prefs.getString(
+                        KEY_SERVER_URL,
+                        ""
+                );
+        String previousRoom =
+                prefs.getString(
+                        KEY_ROOM,
+                        ""
+                );
+        String previousSessionId =
+                prefs.getString(
+                        KEY_SESSION_ID,
+                        ""
+                );
+        /*
+         * 前回がactiveなまま、
+         * clean_stopにもなっていなければ、
+         * Androidプロセスが突然終了した可能性がある。
+         *
+         * ただし、これだけでは
+         * Javaクラッシュ・Native crash・OSによる
+         * process killなどを区別できない。
+         */
+        if (sessionActive && !cleanStop) {
             Log.e(
                     TAG,
-                    "Previous session ended unexpectedly. stage="
+                    "Previous session ended unexpectedly"
+            );
+            Log.e(
+                    TAG,
+                    "Previous session ID="
+                            + previousSessionId
+            );
+            Log.e(
+                    TAG,
+                    "Previous stage="
                             + previousStage
             );
-            /*
-             * serverUrlはプロセス終了時に保持できないため、
-             * SharedPreferencesから前回のURLを取得する。
-             */
-            String previousServerUrl =
-                    prefs.getString(
-                            "server_url",
-                            ""
-                    );
-            String previousRoom =
-                    prefs.getString(
-                            "room",
-                            ""
-                    );
-            sendCrashReport(
-                    previousServerUrl,
-                    previousRoom,
-                    "previous_native_crash_or_process_death",
-                    null,
-                    previousStage
-            );
-            prefs.edit()
-                    .putBoolean(
-                            KEY_RUNNING,
-                            false
-                    )
-                    .apply();
+            if (previousServerUrl != null
+                    && !previousServerUrl.isEmpty()) {
+                sendCrashReport(
+                        previousServerUrl,
+                        previousRoom,
+                        "previous_process_ended",
+                        null,
+                        previousStage
+                );
+            }
         }
-        setStage("service_created");
+        /*
+         * 前回セッション情報をリセット。
+         *
+         * 今回のセッションはonStartCommand()で
+         * 明示的にactiveへ変更する。
+         */
+        prefs.edit()
+                .putBoolean(
+                        KEY_SESSION_ACTIVE,
+                        false
+                )
+                .putBoolean(
+                        KEY_CLEAN_STOP,
+                        true
+                )
+                .putBoolean(
+                        KEY_RUNNING,
+                        false
+                )
+                .apply();
+        setStage(
+                "service_created"
+        );
     }
     @Override
     public int onStartCommand(
@@ -153,28 +221,53 @@ public class MirrorService extends Service {
             int flags,
             int startId
     ) {
+        Log.i(
+                TAG,
+                "onStartCommand"
+        );
         if (intent == null) {
+            Log.w(
+                    TAG,
+                    "Intent is null"
+            );
             return START_NOT_STICKY;
         }
+        /*
+         * STOP
+         */
         if (ACTION_STOP.equals(
                 intent.getAction()
         )) {
-            setStage("stop_requested");
+            setStage(
+                    "stop_requested"
+            );
+            /*
+             * 明示的な停止なので、
+             * crash扱いしない。
+             */
+            markCleanStop();
             stopMirror();
             stopSelf();
             return START_NOT_STICKY;
         }
+        /*
+         * START
+         */
         if (ACTION_START.equals(
                 intent.getAction()
         )) {
-            setStage("start_requested");
+            setStage(
+                    "start_requested"
+            );
             int resultCode =
                     intent.getIntExtra(
                             EXTRA_RESULT_CODE,
                             -1
                     );
             Intent projectionData =
-                    getProjectionData(intent);
+                    getProjectionData(
+                            intent
+                    );
             serverUrl =
                     intent.getStringExtra(
                             EXTRA_SERVER_URL
@@ -184,7 +277,19 @@ public class MirrorService extends Service {
                             EXTRA_ROOM
                     );
             /*
+             * 新しいセッションID
+             */
+            String sessionId =
+                    UUID.randomUUID()
+                            .toString();
+            /*
              * 次回起動時のクラッシュ調査用に保存。
+             *
+             * この時点から
+             * session_active=true
+             * clean_stop=false
+             *
+             * にする。
              */
             getSharedPreferences(
                     DEBUG_PREFS,
@@ -192,22 +297,42 @@ public class MirrorService extends Service {
             )
                     .edit()
                     .putString(
-                            "server_url",
+                            KEY_SERVER_URL,
                             serverUrl == null
                                     ? ""
                                     : serverUrl
                     )
                     .putString(
-                            "room",
+                            KEY_ROOM,
                             room == null
                                     ? ""
                                     : room
+                    )
+                    .putString(
+                            KEY_SESSION_ID,
+                            sessionId
+                    )
+                    .putBoolean(
+                            KEY_SESSION_ACTIVE,
+                            true
+                    )
+                    .putBoolean(
+                            KEY_CLEAN_STOP,
+                            false
                     )
                     .putBoolean(
                             KEY_RUNNING,
                             true
                     )
                     .apply();
+            Log.i(
+                    TAG,
+                    "New session started: "
+                            + sessionId
+            );
+            /*
+             * パラメータチェック
+             */
             if (projectionData == null
                     || serverUrl == null
                     || room == null
@@ -220,7 +345,9 @@ public class MirrorService extends Service {
                         TAG,
                         error
                 );
-                saveError(error);
+                saveError(
+                        error
+                );
                 sendCrashReport(
                         serverUrl,
                         room,
@@ -228,6 +355,11 @@ public class MirrorService extends Service {
                         null,
                         "start_requested"
                 );
+                /*
+                 * これはクラッシュではなく
+                 * 起動パラメータ不正による終了。
+                 */
+                markCleanStop();
                 stopSelf();
                 return START_NOT_STICKY;
             }
@@ -235,7 +367,9 @@ public class MirrorService extends Service {
              * Foreground Service開始
              */
             try {
-                setStage("foreground_start:start");
+                setStage(
+                        "foreground_start:start"
+                );
                 if (Build.VERSION.SDK_INT >= 29) {
                     startForeground(
                             NOTIFICATION_ID,
@@ -253,7 +387,9 @@ public class MirrorService extends Service {
                             )
                     );
                 }
-                setStage("foreground_start:success");
+                setStage(
+                        "foreground_start:success"
+                );
             } catch (Throwable e) {
                 Log.e(
                         TAG,
@@ -271,6 +407,7 @@ public class MirrorService extends Service {
                         e,
                         "foreground_start:start"
                 );
+                markCleanStop();
                 stopSelf();
                 return START_NOT_STICKY;
             }
@@ -304,7 +441,9 @@ public class MirrorService extends Service {
             Intent projectionData
     ) {
         try {
-            setStage("webrtc_initialize:start");
+            setStage(
+                    "webrtc_initialize:start"
+            );
             /*
              * WebRTC初期化
              */
@@ -319,14 +458,20 @@ public class MirrorService extends Service {
                             )
                             .createInitializationOptions()
             );
-            setStage("webrtc_initialize:success");
+            setStage(
+                    "webrtc_initialize:success"
+            );
             /*
              * EGL
              */
-            setStage("egl_create:start");
+            setStage(
+                    "egl_create:start"
+            );
             eglBase =
                     EglBase.create();
-            setStage("egl_create:success");
+            setStage(
+                    "egl_create:success"
+            );
             /*
              * Encoder / Decoder
              */
@@ -344,14 +489,18 @@ public class MirrorService extends Service {
                     new DefaultVideoDecoderFactory(
                             eglBase.getEglBaseContext()
                     );
-            setStage("codec_factory:created");
+            setStage(
+                    "codec_factory:created"
+            );
             /*
              * PeerConnectionFactory
              */
             factory =
                     PeerConnectionFactory
                             .builder()
-                            .setOptions(options)
+                            .setOptions(
+                                    options
+                            )
                             .setVideoEncoderFactory(
                                     encoderFactory
                             )
@@ -364,7 +513,9 @@ public class MirrorService extends Service {
                         "PeerConnectionFactory is null"
                 );
             }
-            setStage("peer_factory:success");
+            setStage(
+                    "peer_factory:success"
+            );
             /*
              * VideoSource
              */
@@ -377,7 +528,9 @@ public class MirrorService extends Service {
                         "VideoSource is null"
                 );
             }
-            setStage("video_source:success");
+            setStage(
+                    "video_source:success"
+            );
             /*
              * MediaProjection
              */
@@ -394,12 +547,19 @@ public class MirrorService extends Service {
                                     setStage(
                                             "media_projection:stopped"
                                     );
+                                    /*
+                                     * MediaProjectionの停止は
+                                     * 明示的な終了として扱う。
+                                     */
+                                    markCleanStop();
                                     stopMirror();
                                     stopSelf();
                                 }
                             }
                     );
-            setStage("screen_capturer:created");
+            setStage(
+                    "screen_capturer:created"
+            );
             /*
              * SurfaceTextureHelper
              */
@@ -425,7 +585,9 @@ public class MirrorService extends Service {
                     videoSource
                             .getCapturerObserver()
             );
-            setStage("capturer_initialize:success");
+            setStage(
+                    "capturer_initialize:success"
+            );
             /*
              * 解像度
              */
@@ -516,12 +678,27 @@ public class MirrorService extends Service {
                     e,
                     getCurrentStage()
             );
+            /*
+             * Java例外による終了なので、
+             * 今回のセッションは正常終了扱いにはしない。
+             *
+             * ただし、ここではstopMirror()まで
+             * 実行できるので、リソース解放を行う。
+             */
             stopMirror();
             stopSelf();
         }
     }
     /*
      * 現在の処理段階を保存
+     *
+     * 重要：
+     * stageを更新するだけで
+     * session_activeを変更しない。
+     *
+     * 以前はここでKEY_RUNNING=trueにしていたため、
+     * websocket:closedなどの非クラッシュイベントが
+     * 次回起動時のクラッシュ判定につながる可能性があった。
      */
     private void setStage(
             String stage
@@ -539,10 +716,6 @@ public class MirrorService extends Service {
                         KEY_STAGE,
                         stage
                 )
-                .putBoolean(
-                        KEY_RUNNING,
-                        true
-                )
                 .apply();
     }
     private String getCurrentStage() {
@@ -554,6 +727,33 @@ public class MirrorService extends Service {
                         KEY_STAGE,
                         "unknown"
                 );
+    }
+    /*
+     * セッションを正常終了としてマーク。
+     */
+    private void markCleanStop() {
+        Log.i(
+                TAG,
+                "Marking session as clean stop"
+        );
+        getSharedPreferences(
+                DEBUG_PREFS,
+                MODE_PRIVATE
+        )
+                .edit()
+                .putBoolean(
+                        KEY_SESSION_ACTIVE,
+                        false
+                )
+                .putBoolean(
+                        KEY_CLEAN_STOP,
+                        true
+                )
+                .putBoolean(
+                        KEY_RUNNING,
+                        false
+                )
+                .apply();
     }
     /*
      * Renderへクラッシュ情報を送信
@@ -583,7 +783,8 @@ public class MirrorService extends Service {
                                 url.length() - 1
                         );
             }
-            url += "/crash-report";
+            url +=
+                    "/crash-report";
             JSONObject json =
                     new JSONObject();
             json.put(
@@ -638,6 +839,10 @@ public class MirrorService extends Service {
                         sw.toString()
                 );
             } else {
+                /*
+                 * Java例外を取得できない
+                 * プロセス終了の場合。
+                 */
                 json.put(
                         "exception",
                         "ProcessDeathOrNativeCrash"
@@ -715,7 +920,9 @@ public class MirrorService extends Service {
                         + String.valueOf(
                                 e.getMessage()
                         );
-        saveError(message);
+        saveError(
+                message
+        );
     }
     private void saveError(
             String message
@@ -790,11 +997,18 @@ public class MirrorService extends Service {
                                     setStage(
                                             "websocket:send_join"
                                     );
-                                    webSocket.send(
-                                            join.toString()
+                                    boolean sent =
+                                            webSocket.send(
+                                                    join.toString()
+                                            );
+                                    Log.i(
+                                            TAG,
+                                            "join send returned: "
+                                                    + sent
                                     );
                                     setStage(
-                                            "websocket:join_sent"
+                                            "websocket:join_sent:"
+                                                    + sent
                                     );
                                 } catch (Throwable e) {
                                     Log.e(
@@ -821,7 +1035,9 @@ public class MirrorService extends Service {
                                         "WebSocket message: "
                                                 + text
                                 );
-                                handleSignal(text);
+                                handleSignal(
+                                        text
+                                );
                             }
                             @Override
                             public void onFailure(
@@ -850,8 +1066,18 @@ public class MirrorService extends Service {
                                 Log.i(
                                         TAG,
                                         "WebSocket closed: "
+                                                + code
+                                                + " / "
                                                 + reason
                                 );
+                                /*
+                                 * WebSocketが閉じただけでは
+                                 * Androidプロセスが終了したとは
+                                 * 判断しない。
+                                 *
+                                 * session_active /
+                                 * clean_stop は変更しない。
+                                 */
                                 setStage(
                                         "websocket:closed"
                                 );
@@ -1113,7 +1339,8 @@ public class MirrorService extends Service {
                             @Override
                             public void onIceConnectionReceivingChange(
                                     boolean receiving
-                            ) {}
+                            ) {
+                            }
                             @Override
                             public void onIceGatheringChange(
                                     PeerConnection.IceGatheringState state
@@ -1138,19 +1365,23 @@ public class MirrorService extends Service {
                             @Override
                             public void onIceCandidatesRemoved(
                                     IceCandidate[] candidates
-                            ) {}
+                            ) {
+                            }
                             @Override
                             public void onAddStream(
                                     org.webrtc.MediaStream stream
-                            ) {}
+                            ) {
+                            }
                             @Override
                             public void onRemoveStream(
                                     org.webrtc.MediaStream stream
-                            ) {}
+                            ) {
+                            }
                             @Override
                             public void onDataChannel(
                                     DataChannel dataChannel
-                            ) {}
+                            ) {
+                            }
                             @Override
                             public void onRenegotiationNeeded() {
                                 Log.i(
@@ -1163,7 +1394,8 @@ public class MirrorService extends Service {
                             public void onAddTrack(
                                     RtpReceiver receiver,
                                     org.webrtc.MediaStream[] streams
-                            ) {}
+                            ) {
+                            }
                         }
                 );
         setStage(
@@ -1171,8 +1403,7 @@ public class MirrorService extends Service {
         );
         if (pc != null) {
             /*
-             * 今回特に重要な箇所。
-             * Viewer接続時にここでクラッシュするか確認する。
+             * Viewer接続時の重要箇所。
              */
             setStage(
                     "peer:addTrack:start"
@@ -1260,7 +1491,8 @@ public class MirrorService extends Service {
                         );
                     }
                     @Override
-                    public void onSetSuccess() {}
+                    public void onSetSuccess() {
+                    }
                     @Override
                     public void onCreateFailure(
                             String error
@@ -1354,6 +1586,14 @@ public class MirrorService extends Service {
                         "sdp:send:returned:"
                                 + sent
                 );
+            } else {
+                Log.w(
+                        TAG,
+                        "sendSdp: socket is null"
+                );
+                setStage(
+                        "sdp:send:socket_null"
+                );
             }
         } catch (Throwable e) {
             Log.e(
@@ -1407,8 +1647,14 @@ public class MirrorService extends Service {
                 setStage(
                         "candidate:send"
                 );
-                socket.send(
-                        msg.toString()
+                boolean sent =
+                        socket.send(
+                                msg.toString()
+                        );
+                Log.i(
+                        TAG,
+                        "candidate send returned: "
+                                + sent
                 );
             }
         } catch (Throwable e) {
@@ -1431,70 +1677,107 @@ public class MirrorService extends Service {
                 "stop:start"
         );
         try {
+            /*
+             * PeerConnection
+             */
             for (
                     PeerConnection pc :
                     peers.values()
             ) {
                 try {
                     pc.close();
-                } catch (Throwable ignored) {}
+                } catch (Throwable ignored) {
+                }
             }
             peers.clear();
+            /*
+             * WebSocket
+             */
             if (socket != null) {
                 try {
                     socket.close(
                             1000,
                             "stopped"
                     );
-                } catch (Throwable ignored) {}
+                } catch (Throwable ignored) {
+                }
                 socket = null;
             }
+            /*
+             * Capturer
+             */
             if (capturer != null) {
                 try {
                     capturer.stopCapture();
-                } catch (Throwable ignored) {}
+                } catch (Throwable ignored) {
+                }
                 try {
                     capturer.dispose();
-                } catch (Throwable ignored) {}
+                } catch (Throwable ignored) {
+                }
                 capturer = null;
             }
+            /*
+             * VideoSource
+             */
             if (videoSource != null) {
                 try {
                     videoSource.dispose();
-                } catch (Throwable ignored) {}
+                } catch (Throwable ignored) {
+                }
                 videoSource = null;
             }
+            /*
+             * VideoTrack
+             */
             if (screenTrack != null) {
                 try {
                     screenTrack.dispose();
-                } catch (Throwable ignored) {}
+                } catch (Throwable ignored) {
+                }
                 screenTrack = null;
             }
+            /*
+             * SurfaceTextureHelper
+             */
             if (surfaceTextureHelper != null) {
                 try {
                     surfaceTextureHelper.dispose();
-                } catch (Throwable ignored) {}
+                } catch (Throwable ignored) {
+                }
                 surfaceTextureHelper = null;
             }
+            /*
+             * PeerConnectionFactory
+             */
             if (factory != null) {
                 try {
                     factory.dispose();
-                } catch (Throwable ignored) {}
+                } catch (Throwable ignored) {
+                }
                 factory = null;
             }
+            /*
+             * EGL
+             */
             if (eglBase != null) {
                 try {
                     eglBase.release();
-                } catch (Throwable ignored) {}
+                } catch (Throwable ignored) {
+                }
                 eglBase = null;
             }
+            /*
+             * HTTP client
+             */
             if (httpClient != null) {
                 try {
                     httpClient
                             .dispatcher()
                             .executorService()
                             .shutdown();
-                } catch (Throwable ignored) {}
+                } catch (Throwable ignored) {
+                }
                 httpClient = null;
             }
         } catch (Throwable e) {
@@ -1512,22 +1795,13 @@ public class MirrorService extends Service {
             );
         } finally {
             /*
-             * 正常停止。
+             * stopMirror()まで到達した場合、
+             * 正常なリソース解放処理として扱う。
              */
-            getSharedPreferences(
-                    DEBUG_PREFS,
-                    MODE_PRIVATE
-            )
-                    .edit()
-                    .putBoolean(
-                            KEY_RUNNING,
-                            false
-                    )
-                    .putString(
-                            KEY_STAGE,
-                            "normal_stop"
-                    )
-                    .apply();
+            markCleanStop();
+            setStage(
+                    "normal_stop"
+            );
         }
     }
     private Notification buildNotification(
@@ -1559,7 +1833,9 @@ public class MirrorService extends Service {
                 .setContentText(
                         text
                 )
-                .setContentIntent(pi)
+                .setContentIntent(
+                        pi
+                )
                 .setOngoing(true)
                 .setCategory(
                         NotificationCompat
@@ -1577,7 +1853,9 @@ public class MirrorService extends Service {
         if (manager != null) {
             manager.notify(
                     NOTIFICATION_ID,
-                    buildNotification(text)
+                    buildNotification(
+                            text
+                    )
             );
         }
     }
@@ -1607,6 +1885,15 @@ public class MirrorService extends Service {
     }
     @Override
     public void onDestroy() {
+        Log.i(
+                TAG,
+                "MirrorService onDestroy"
+        );
+        /*
+         * AndroidからServiceが正常に破棄された場合も
+         * 明示的な終了として扱う。
+         */
+        markCleanStop();
         stopMirror();
         super.onDestroy();
     }
@@ -1622,16 +1909,21 @@ public class MirrorService extends Service {
         @Override
         public void onCreateSuccess(
                 SessionDescription sdp
-        ) {}
+        ) {
+        }
         @Override
-        public void onSetSuccess() {}
+        public void onSetSuccess()
+        {
+        }
         @Override
         public void onCreateFailure(
                 String error
-        ) {}
+        ) {
+        }
         @Override
         public void onSetFailure(
                 String error
-        ) {}
+        ) {
+        }
     }
 }
