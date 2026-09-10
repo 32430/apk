@@ -9,13 +9,10 @@ Xiaomi/Android端末からMediaProjection + WebRTCで画面を配信するアプ
 - インターネット接続
 - 先に用意したRender側の `server.js` / `Browser.html`
 
-## Render側
+## server側
 
-`server.js` が動いているURLをアプリの「RenderサーバーURL」に入力します。
+`server.js` が動いているURLをアプリのサーバーURLに入力します。
 
-例:
-
-`https://lu1221.onrender.com`
 
 ## ビルド
 
