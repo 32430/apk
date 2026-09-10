@@ -1635,7 +1635,3 @@ public class MirrorService extends Service {
         ) {}
     }
 }
-
-今回変更したのは主に sendSdp() の部分で、sdp:send:start → socket.send() → sdp:send:returned:true/false のどこまで進んだかを記録できるようにしています。
-
-この状態で再ビルドして、同じようにクラッシュを再現してください。Renderに出た新しい ANDROID CRASH REPORT を貼ってもらえれば、次の箇所を絞れます。
