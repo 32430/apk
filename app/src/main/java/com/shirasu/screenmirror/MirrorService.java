@@ -1,4 +1,3 @@
-:::writing{variant="document" id="58321" title="修正版 MirrorService.java"}
 package com.shirasu.screenmirror;
 
 import android.app.Activity;
@@ -2454,4 +2453,3 @@ public class MirrorService extends Service {
         ) {}
     }
 }
-:::
