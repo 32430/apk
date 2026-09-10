@@ -1,0 +1,40 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'com.shirasu.screenmirror'
+    compileSdk 36
+
+    defaultConfig {
+        applicationId 'com.shirasu.screenmirror'
+        minSdk 23
+        targetSdk 36
+        versionCode 1
+        versionName '1.0'
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            shrinkResources false
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}
+
+dependencies {
+    implementation 'androidx.appcompat:appcompat:1.7.1'
+    implementation 'com.google.android.material:material:1.13.0'
+    implementation 'androidx.core:core:1.17.0'
+
+    // WebRTC Android SDK
+    implementation 'io.github.webrtc-sdk:android:150.7871.01'
+
+    // WebSocket client
+    implementation 'com.squareup.okhttp3:okhttp:4.12.0'
+}
