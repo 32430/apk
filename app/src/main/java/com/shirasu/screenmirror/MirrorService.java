@@ -1322,11 +1322,37 @@ public class MirrorService extends Service {
                     data
             );
             if (socket != null) {
+                /*
+                 * SDP送信直前
+                 */
                 setStage(
-                        "sdp:send"
+                        "sdp:send:start"
                 );
-                socket.send(
-                        msg.toString()
+                String message =
+                        msg.toString();
+                Log.i(
+                        TAG,
+                        "Sending SDP length="
+                                + message.length()
+                );
+                /*
+                 * WebSocket送信
+                 */
+                boolean sent =
+                        socket.send(
+                                message
+                        );
+                /*
+                 * socket.send()から戻ったか確認
+                 */
+                Log.i(
+                        TAG,
+                        "socket.send returned: "
+                                + sent
+                );
+                setStage(
+                        "sdp:send:returned:"
+                                + sent
                 );
             }
         } catch (Throwable e) {
@@ -1609,3 +1635,7 @@ public class MirrorService extends Service {
         ) {}
     }
 }
+
+今回変更したのは主に sendSdp() の部分で、sdp:send:start → socket.send() → sdp:send:returned:true/false のどこまで進んだかを記録できるようにしています。
+
+この状態で再ビルドして、同じようにクラッシュを再現してください。Renderに出た新しい ANDROID CRASH REPORT を貼ってもらえれば、次の箇所を絞れます。
