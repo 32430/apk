@@ -1,4 +1,6 @@
+:::writing{variant="document" id="58321" title="修正版 MirrorService.java"}
 package com.shirasu.screenmirror;
+
 import android.app.Activity;
 import android.app.Notification;
 import android.app.NotificationChannel;
@@ -12,8 +14,10 @@ import android.media.projection.MediaProjection;
 import android.os.Build;
 import android.os.IBinder;
 import android.util.Log;
+
 import androidx.annotation.Nullable;
 import androidx.core.app.NotificationCompat;
+
 import org.json.JSONObject;
 import org.webrtc.DataChannel;
 import org.webrtc.DefaultVideoDecoderFactory;
@@ -31,13 +35,14 @@ import org.webrtc.SurfaceTextureHelper;
 import org.webrtc.VideoCapturer;
 import org.webrtc.VideoSource;
 import org.webrtc.VideoTrack;
+
 import java.io.PrintWriter;
 import java.io.StringWriter;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.UUID;
+
 import okhttp3.MediaType;
 import okhttp3.OkHttpClient;
 import okhttp3.Request;
@@ -45,272 +50,336 @@ import okhttp3.RequestBody;
 import okhttp3.Response;
 import okhttp3.WebSocket;
 import okhttp3.WebSocketListener;
+
 public class MirrorService extends Service {
+
     public static final String ACTION_START =
             "com.shirasu.screenmirror.START";
+
     public static final String ACTION_STOP =
             "com.shirasu.screenmirror.STOP";
+
     public static final String EXTRA_RESULT_CODE =
             "resultCode";
+
     public static final String EXTRA_PROJECTION_DATA =
             "projectionData";
+
     public static final String EXTRA_SERVER_URL =
             "serverUrl";
+
     public static final String EXTRA_ROOM =
             "room";
+
     private static final String TAG =
             "ScreenMirror";
+
     private static final String CHANNEL_ID =
             "screen_mirror";
+
     private static final int NOTIFICATION_ID =
             77;
+
     /*
      * デバッグ情報
      */
     private static final String DEBUG_PREFS =
             "debug";
+
     private static final String KEY_STAGE =
             "last_stage";
-    private static final String KEY_RUNNING =
-            "running";
+
     /*
-     * セッション状態
+     * 前回セッションが実行中だったか。
      *
-     * session_active=true
-     * clean_stop=false
-     *
-     * の状態で次回Serviceが起動した場合、
-     * 前回プロセスが正常な終了処理を通らずに
-     * 終了した可能性がある。
+     * setStage()では変更しない。
      */
     private static final String KEY_SESSION_ACTIVE =
             "session_active";
+
+    /*
+     * 正常停止したか。
+     */
     private static final String KEY_CLEAN_STOP =
             "clean_stop";
-    private static final String KEY_SESSION_ID =
-            "session_id";
+
+    /*
+     * 前回接続情報
+     */
     private static final String KEY_SERVER_URL =
             "server_url";
+
     private static final String KEY_ROOM =
             "room";
+
     private OkHttpClient httpClient;
     private WebSocket socket;
+
     private PeerConnectionFactory factory;
     private EglBase eglBase;
     private SurfaceTextureHelper surfaceTextureHelper;
+
     private VideoSource videoSource;
     private VideoTrack screenTrack;
     private VideoCapturer capturer;
+
     private String room;
     private String serverUrl;
     private String clientId;
+
+    /*
+     * stopMirror() が複数回呼ばれても
+     * 後続処理が暴れないようにする。
+     */
+    private volatile boolean stopping = false;
+
     private final Map<String, PeerConnection> peers =
             new HashMap<>();
+
+    // ============================================================
+    // Service lifecycle
+    // ============================================================
+
     @Override
     public void onCreate() {
         super.onCreate();
-        Log.i(
-                TAG,
-                "MirrorService onCreate"
-        );
+
         createNotificationChannel();
+
+        /*
+         * 前回セッションが異常終了していないか確認。
+         *
+         * Native crash / Process death の場合、
+         * onDestroy() が呼ばれない可能性がある。
+         */
         SharedPreferences prefs =
                 getSharedPreferences(
                         DEBUG_PREFS,
                         MODE_PRIVATE
                 );
-        /*
-         * 前回セッションが正常終了したか確認。
-         *
-         * 以前は KEY_RUNNING だけで判定していたため、
-         * WebSocketの終了やServiceの通常終了などでも
-         * 誤検出する可能性があった。
-         */
-        boolean sessionActive =
+
+        boolean previousSessionActive =
                 prefs.getBoolean(
                         KEY_SESSION_ACTIVE,
                         false
                 );
-        boolean cleanStop =
+
+        boolean previousCleanStop =
                 prefs.getBoolean(
                         KEY_CLEAN_STOP,
                         true
                 );
+
         String previousStage =
                 prefs.getString(
                         KEY_STAGE,
                         "unknown"
                 );
-        String previousServerUrl =
-                prefs.getString(
-                        KEY_SERVER_URL,
-                        ""
-                );
-        String previousRoom =
-                prefs.getString(
-                        KEY_ROOM,
-                        ""
-                );
-        String previousSessionId =
-                prefs.getString(
-                        KEY_SESSION_ID,
-                        ""
-                );
+
+        Log.i(
+                TAG,
+                "Previous session state: active="
+                        + previousSessionActive
+                        + ", cleanStop="
+                        + previousCleanStop
+                        + ", stage="
+                        + previousStage
+        );
+
         /*
-         * 前回がactiveなまま、
-         * clean_stopにもなっていなければ、
-         * Androidプロセスが突然終了した可能性がある。
-         *
-         * ただし、これだけでは
-         * Javaクラッシュ・Native crash・OSによる
-         * process killなどを区別できない。
+         * 本当に「前回セッションが途中で消えた」
+         * 場合だけ異常終了として扱う。
          */
-        if (sessionActive && !cleanStop) {
+        if (previousSessionActive
+                && !previousCleanStop) {
+
             Log.e(
                     TAG,
-                    "Previous session ended unexpectedly"
-            );
-            Log.e(
-                    TAG,
-                    "Previous session ID="
-                            + previousSessionId
-            );
-            Log.e(
-                    TAG,
-                    "Previous stage="
+                    "Previous session ended unexpectedly. stage="
                             + previousStage
             );
-            if (previousServerUrl != null
-                    && !previousServerUrl.isEmpty()) {
-                sendCrashReport(
-                        previousServerUrl,
-                        previousRoom,
-                        "previous_process_ended",
-                        null,
-                        previousStage
-                );
-            }
+
+            String previousServerUrl =
+                    prefs.getString(
+                            KEY_SERVER_URL,
+                            ""
+                    );
+
+            String previousRoom =
+                    prefs.getString(
+                            KEY_ROOM,
+                            ""
+                    );
+
+            /*
+             * 今回の起動前に前回状態をリセット。
+             */
+            prefs.edit()
+                    .putBoolean(
+                            KEY_SESSION_ACTIVE,
+                            false
+                    )
+                    .putBoolean(
+                            KEY_CLEAN_STOP,
+                            true
+                    )
+                    .apply();
+
+            /*
+             * 前回プロセス死亡のレポート。
+             *
+             * これは「Native crashだった」と
+             * 断定するものではない。
+             */
+            sendCrashReport(
+                    previousServerUrl,
+                    previousRoom,
+                    "previous_native_crash_or_process_death",
+                    null,
+                    previousStage
+            );
         }
+
         /*
-         * 前回セッション情報をリセット。
+         * 今回のService生成。
          *
-         * 今回のセッションはonStartCommand()で
-         * 明示的にactiveへ変更する。
+         * ここではセッション開始扱いにしない。
          */
-        prefs.edit()
-                .putBoolean(
-                        KEY_SESSION_ACTIVE,
-                        false
-                )
-                .putBoolean(
-                        KEY_CLEAN_STOP,
-                        true
-                )
-                .putBoolean(
-                        KEY_RUNNING,
-                        false
-                )
-                .apply();
         setStage(
                 "service_created"
         );
     }
+
     @Override
     public int onStartCommand(
             Intent intent,
             int flags,
             int startId
     ) {
-        Log.i(
-                TAG,
-                "onStartCommand"
-        );
+
         if (intent == null) {
-            Log.w(
-                    TAG,
-                    "Intent is null"
-            );
             return START_NOT_STICKY;
         }
-        /*
-         * STOP
-         */
+
+        // ========================================================
+        // STOP
+        // ========================================================
+
         if (ACTION_STOP.equals(
                 intent.getAction()
         )) {
+
+            Log.i(
+                    TAG,
+                    "Stop requested"
+            );
+
             setStage(
                     "stop_requested"
             );
+
             /*
              * 明示的な停止なので、
-             * crash扱いしない。
+             * 先に正常終了フラグを立てる。
              */
             markCleanStop();
+
             stopMirror();
+
             stopSelf();
+
             return START_NOT_STICKY;
         }
-        /*
-         * START
-         */
+
+        // ========================================================
+        // START
+        // ========================================================
+
         if (ACTION_START.equals(
                 intent.getAction()
         )) {
+
+            stopping = false;
+
             setStage(
                     "start_requested"
             );
+
             int resultCode =
                     intent.getIntExtra(
                             EXTRA_RESULT_CODE,
                             -1
                     );
+
             Intent projectionData =
-                    getProjectionData(
-                            intent
-                    );
+                    getProjectionData(intent);
+
             serverUrl =
                     intent.getStringExtra(
                             EXTRA_SERVER_URL
                     );
+
             room =
                     intent.getStringExtra(
                             EXTRA_ROOM
                     );
+
             /*
-             * 新しいセッションID
+             * 入力値確認。
              */
-            String sessionId =
-                    UUID.randomUUID()
-                            .toString();
+            if (projectionData == null
+                    || serverUrl == null
+                    || room == null
+                    || resultCode != Activity.RESULT_OK) {
+
+                String error =
+                        "画面共有データが不正です。\n"
+                                + "resultCode="
+                                + resultCode;
+
+                Log.e(
+                        TAG,
+                        error
+                );
+
+                saveError(error);
+
+                setStage(
+                        "invalid_projection_data"
+                );
+
+                sendCrashReport(
+                        serverUrl,
+                        room,
+                        "invalid_projection_data",
+                        null,
+                        "start_requested"
+                );
+
+                markCleanStop();
+
+                stopSelf();
+
+                return START_NOT_STICKY;
+            }
+
             /*
-             * 次回起動時のクラッシュ調査用に保存。
-             *
-             * この時点から
-             * session_active=true
-             * clean_stop=false
-             *
-             * にする。
+             * ここで初めて「実際のセッション開始」。
              */
-            getSharedPreferences(
-                    DEBUG_PREFS,
-                    MODE_PRIVATE
-            )
-                    .edit()
+            SharedPreferences prefs =
+                    getSharedPreferences(
+                            DEBUG_PREFS,
+                            MODE_PRIVATE
+                    );
+
+            prefs.edit()
                     .putString(
                             KEY_SERVER_URL,
-                            serverUrl == null
-                                    ? ""
-                                    : serverUrl
+                            serverUrl
                     )
                     .putString(
                             KEY_ROOM,
-                            room == null
-                                    ? ""
-                                    : room
-                    )
-                    .putString(
-                            KEY_SESSION_ID,
-                            sessionId
+                            room
                     )
                     .putBoolean(
                             KEY_SESSION_ACTIVE,
@@ -320,57 +389,25 @@ public class MirrorService extends Service {
                             KEY_CLEAN_STOP,
                             false
                     )
-                    .putBoolean(
-                            KEY_RUNNING,
-                            true
-                    )
                     .apply();
+
             Log.i(
                     TAG,
-                    "New session started: "
-                            + sessionId
+                    "Session marked active"
             );
-            /*
-             * パラメータチェック
-             */
-            if (projectionData == null
-                    || serverUrl == null
-                    || room == null
-                    || resultCode != Activity.RESULT_OK) {
-                String error =
-                        "画面共有データが不正です。\n"
-                                + "resultCode="
-                                + resultCode;
-                Log.e(
-                        TAG,
-                        error
-                );
-                saveError(
-                        error
-                );
-                sendCrashReport(
-                        serverUrl,
-                        room,
-                        "invalid_projection_data",
-                        null,
-                        "start_requested"
-                );
-                /*
-                 * これはクラッシュではなく
-                 * 起動パラメータ不正による終了。
-                 */
-                markCleanStop();
-                stopSelf();
-                return START_NOT_STICKY;
-            }
-            /*
-             * Foreground Service開始
-             */
+
+            // ====================================================
+            // Foreground Service
+            // ====================================================
+
             try {
+
                 setStage(
                         "foreground_start:start"
                 );
+
                 if (Build.VERSION.SDK_INT >= 29) {
+
                     startForeground(
                             NOTIFICATION_ID,
                             buildNotification(
@@ -379,7 +416,9 @@ public class MirrorService extends Service {
                             ServiceInfo
                                     .FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
                     );
+
                 } else {
+
                     startForeground(
                             NOTIFICATION_ID,
                             buildNotification(
@@ -387,19 +426,24 @@ public class MirrorService extends Service {
                             )
                     );
                 }
+
                 setStage(
                         "foreground_start:success"
                 );
+
             } catch (Throwable e) {
+
                 Log.e(
                         TAG,
                         "startForeground failed",
                         e
                 );
+
                 saveError(
                         "Foreground Service開始エラー",
                         e
                 );
+
                 sendCrashReport(
                         serverUrl,
                         room,
@@ -407,46 +451,66 @@ public class MirrorService extends Service {
                         e,
                         "foreground_start:start"
                 );
+
                 markCleanStop();
+
                 stopSelf();
+
                 return START_NOT_STICKY;
             }
-            /*
-             * MediaProjection + WebRTC開始
-             */
+
+            // ====================================================
+            // MediaProjection + WebRTC
+            // ====================================================
+
             startCapture(
                     resultCode,
                     projectionData
             );
         }
+
         return START_STICKY;
     }
+
     @SuppressWarnings("deprecation")
     private Intent getProjectionData(
             Intent intent
     ) {
+
         if (Build.VERSION.SDK_INT >= 33) {
+
             return intent.getParcelableExtra(
                     EXTRA_PROJECTION_DATA,
                     Intent.class
             );
+
         } else {
+
             return intent.getParcelableExtra(
                     EXTRA_PROJECTION_DATA
             );
         }
     }
+
+    // ============================================================
+    // Capture
+    // ============================================================
+
     private void startCapture(
             int resultCode,
             Intent projectionData
     ) {
+
         try {
+
             setStage(
                     "webrtc_initialize:start"
             );
-            /*
-             * WebRTC初期化
-             */
+
+            // ====================================================
+            // WebRTC initialization
+            // ====================================================
+
             PeerConnectionFactory.initialize(
                     PeerConnectionFactory
                             .InitializationOptions
@@ -458,25 +522,33 @@ public class MirrorService extends Service {
                             )
                             .createInitializationOptions()
             );
+
             setStage(
                     "webrtc_initialize:success"
             );
-            /*
-             * EGL
-             */
+
+            // ====================================================
+            // EGL
+            // ====================================================
+
             setStage(
                     "egl_create:start"
             );
+
             eglBase =
                     EglBase.create();
+
             setStage(
                     "egl_create:success"
             );
-            /*
-             * Encoder / Decoder
-             */
+
+            // ====================================================
+            // Encoder / Decoder
+            // ====================================================
+
             PeerConnectionFactory.Options options =
                     new PeerConnectionFactory.Options();
+
             DefaultVideoEncoderFactory
                     encoderFactory =
                     new DefaultVideoEncoderFactory(
@@ -484,23 +556,25 @@ public class MirrorService extends Service {
                             true,
                             false
                     );
+
             DefaultVideoDecoderFactory
                     decoderFactory =
                     new DefaultVideoDecoderFactory(
                             eglBase.getEglBaseContext()
                     );
+
             setStage(
                     "codec_factory:created"
             );
-            /*
-             * PeerConnectionFactory
-             */
+
+            // ====================================================
+            // PeerConnectionFactory
+            // ====================================================
+
             factory =
                     PeerConnectionFactory
                             .builder()
-                            .setOptions(
-                                    options
-                            )
+                            .setOptions(options)
                             .setVideoEncoderFactory(
                                     encoderFactory
                             )
@@ -508,102 +582,128 @@ public class MirrorService extends Service {
                                     decoderFactory
                             )
                             .createPeerConnectionFactory();
+
             if (factory == null) {
+
                 throw new IllegalStateException(
                         "PeerConnectionFactory is null"
                 );
             }
+
             setStage(
                     "peer_factory:success"
             );
-            /*
-             * VideoSource
-             */
+
+            // ====================================================
+            // VideoSource
+            // ====================================================
+
             videoSource =
                     factory.createVideoSource(
                             false
                     );
+
             if (videoSource == null) {
+
                 throw new IllegalStateException(
                         "VideoSource is null"
                 );
             }
+
             setStage(
                     "video_source:success"
             );
-            /*
-             * MediaProjection
-             */
+
+            // ====================================================
+            // MediaProjection
+            // ====================================================
+
             capturer =
                     new ScreenCapturerAndroid(
                             projectionData,
                             new MediaProjection.Callback() {
+
                                 @Override
                                 public void onStop() {
+
                                     Log.i(
                                             TAG,
                                             "MediaProjection stopped"
                                     );
+
                                     setStage(
                                             "media_projection:stopped"
                                     );
-                                    /*
-                                     * MediaProjectionの停止は
-                                     * 明示的な終了として扱う。
-                                     */
+
                                     markCleanStop();
+
                                     stopMirror();
+
                                     stopSelf();
                                 }
                             }
                     );
+
             setStage(
                     "screen_capturer:created"
             );
-            /*
-             * SurfaceTextureHelper
-             */
+
+            // ====================================================
+            // SurfaceTextureHelper
+            // ====================================================
+
             surfaceTextureHelper =
                     SurfaceTextureHelper.create(
                             "ScreenCaptureThread",
                             eglBase.getEglBaseContext()
                     );
+
             if (surfaceTextureHelper == null) {
+
                 throw new IllegalStateException(
                         "SurfaceTextureHelper is null"
                 );
             }
+
             setStage(
                     "surface_texture_helper:success"
             );
-            /*
-             * Capturer初期化
-             */
+
+            // ====================================================
+            // Capturer initialization
+            // ====================================================
+
             capturer.initialize(
                     surfaceTextureHelper,
                     getApplicationContext(),
                     videoSource
                             .getCapturerObserver()
             );
+
             setStage(
                     "capturer_initialize:success"
             );
-            /*
-             * 解像度
-             */
+
+            // ====================================================
+            // Resolution
+            // ====================================================
+
             android.util.DisplayMetrics dm =
                     getResources()
                             .getDisplayMetrics();
+
             int width =
                     Math.min(
                             dm.widthPixels,
                             1920
                     );
+
             int height =
                     Math.min(
                             dm.heightPixels,
                             1080
                     );
+
             Log.i(
                     TAG,
                     "Capture size: "
@@ -611,66 +711,85 @@ public class MirrorService extends Service {
                             + "x"
                             + height
             );
+
             setStage(
                     "capture_start:"
                             + width
                             + "x"
                             + height
             );
-            /*
-             * 画面キャプチャ開始
-             */
+
+            // ====================================================
+            // Start capture
+            // ====================================================
+
             capturer.startCapture(
                     width,
                     height,
                     30
             );
+
             setStage(
                     "capture_start:success"
             );
-            /*
-             * VideoTrack
-             */
+
+            // ====================================================
+            // VideoTrack
+            // ====================================================
+
             screenTrack =
                     factory.createVideoTrack(
                             "screen",
                             videoSource
                     );
+
             if (screenTrack == null) {
+
                 throw new IllegalStateException(
                         "screenTrack is null"
                 );
             }
+
             screenTrack.setEnabled(
                     true
             );
+
             setStage(
                     "screen_track:success"
             );
-            /*
-             * WebSocket接続
-             */
+
+            // ====================================================
+            // WebSocket
+            // ====================================================
+
             setStage(
                     "signaling_connect:start"
             );
+
             connectSignaling();
+
             setStage(
                     "signaling_connect:requested"
             );
+
             updateNotification(
                     "画面共有中 • ルーム "
                             + room
             );
+
         } catch (Throwable e) {
+
             Log.e(
                     TAG,
                     "startCapture failed",
                     e
             );
+
             saveError(
                     "画面共有開始エラー",
                     e
             );
+
             sendCrashReport(
                     serverUrl,
                     room,
@@ -678,35 +797,34 @@ public class MirrorService extends Service {
                     e,
                     getCurrentStage()
             );
-            /*
-             * Java例外による終了なので、
-             * 今回のセッションは正常終了扱いにはしない。
-             *
-             * ただし、ここではstopMirror()まで
-             * 実行できるので、リソース解放を行う。
-             */
+
+            markCleanStop();
+
             stopMirror();
+
             stopSelf();
         }
     }
+
+    // ============================================================
+    // Stage
+    // ============================================================
+
     /*
-     * 現在の処理段階を保存
+     * 現在の処理段階だけを保存する。
      *
      * 重要：
-     * stageを更新するだけで
-     * session_activeを変更しない。
-     *
-     * 以前はここでKEY_RUNNING=trueにしていたため、
-     * websocket:closedなどの非クラッシュイベントが
-     * 次回起動時のクラッシュ判定につながる可能性があった。
+     * ここでは session_active を変更しない。
      */
     private void setStage(
             String stage
     ) {
+
         Log.i(
                 TAG,
                 "STAGE: " + stage
         );
+
         getSharedPreferences(
                 DEBUG_PREFS,
                 MODE_PRIVATE
@@ -718,7 +836,9 @@ public class MirrorService extends Service {
                 )
                 .apply();
     }
+
     private String getCurrentStage() {
+
         return getSharedPreferences(
                 DEBUG_PREFS,
                 MODE_PRIVATE
@@ -728,14 +848,18 @@ public class MirrorService extends Service {
                         "unknown"
                 );
     }
-    /*
-     * セッションを正常終了としてマーク。
-     */
+
+    // ============================================================
+    // Clean stop
+    // ============================================================
+
     private void markCleanStop() {
+
         Log.i(
                 TAG,
                 "Marking session as clean stop"
         );
+
         getSharedPreferences(
                 DEBUG_PREFS,
                 MODE_PRIVATE
@@ -749,15 +873,13 @@ public class MirrorService extends Service {
                         KEY_CLEAN_STOP,
                         true
                 )
-                .putBoolean(
-                        KEY_RUNNING,
-                        false
-                )
                 .apply();
     }
-    /*
-     * Renderへクラッシュ情報を送信
-     */
+
+    // ============================================================
+    // Crash report
+    // ============================================================
+
     private void sendCrashReport(
             String reportServerUrl,
             String reportRoom,
@@ -765,141 +887,221 @@ public class MirrorService extends Service {
             Throwable error,
             String actualStage
     ) {
+
         try {
+
             if (reportServerUrl == null
                     || reportServerUrl.isEmpty()) {
+
                 Log.e(
                         TAG,
                         "Crash report URL is empty"
                 );
+
                 return;
             }
+
             String url =
                     reportServerUrl;
+
             if (url.endsWith("/")) {
+
                 url =
                         url.substring(
                                 0,
                                 url.length() - 1
                         );
             }
-            url +=
-                    "/crash-report";
+
+            url += "/crash-report";
+
             JSONObject json =
                     new JSONObject();
+
             json.put(
                     "device",
                     Build.MANUFACTURER
                             + " "
                             + Build.MODEL
             );
+
             json.put(
                     "androidVersion",
                     Build.VERSION.RELEASE
             );
+
             json.put(
                     "androidSdk",
                     Build.VERSION.SDK_INT
             );
+
             json.put(
                     "appVersion",
                     "1.0"
             );
+
             json.put(
                     "room",
                     reportRoom == null
                             ? ""
                             : reportRoom
             );
+
             json.put(
                     "stage",
                     actualStage == null
                             ? stage
                             : actualStage
             );
+
             if (error != null) {
+
                 json.put(
                         "exception",
                         error.getClass()
                                 .getName()
                 );
+
                 json.put(
                         "message",
                         String.valueOf(
                                 error.getMessage()
                         )
                 );
+
                 StringWriter sw =
                         new StringWriter();
+
                 error.printStackTrace(
                         new PrintWriter(sw)
                 );
+
                 json.put(
                         "stackTrace",
                         sw.toString()
                 );
+
             } else {
+
                 /*
-                 * Java例外を取得できない
-                 * プロセス終了の場合。
+                 * これは「Native crash確定」
+                 * という意味ではない。
+                 *
+                 * 前回のAndroidプロセスが
+                 * clean stopを記録できないまま
+                 * 終了したことを表す。
                  */
                 json.put(
                         "exception",
                         "ProcessDeathOrNativeCrash"
                 );
+
                 json.put(
                         "message",
                         "Android process ended unexpectedly"
                 );
+
                 json.put(
                         "stackTrace",
                         ""
                 );
             }
+
+            String message =
+                    json.toString();
+
+            Log.i(
+                    TAG,
+                    "Crash report sending..."
+            );
+
+            Log.i(
+                    TAG,
+                    "Crash report URL: "
+                            + url
+            );
+
+            Log.i(
+                    TAG,
+                    "Crash report JSON length="
+                            + message.length()
+            );
+
             RequestBody body =
                     RequestBody.create(
-                            json.toString(),
+                            message,
                             MediaType.parse(
                                     "application/json; charset=utf-8"
                             )
                     );
+
             Request request =
                     new Request.Builder()
                             .url(url)
                             .post(body)
                             .build();
+
             OkHttpClient client =
                     new OkHttpClient.Builder()
                             .build();
+
             client.newCall(request)
                     .enqueue(
                             new okhttp3.Callback() {
+
                                 @Override
                                 public void onFailure(
                                         okhttp3.Call call,
                                         java.io.IOException e
                                 ) {
+
                                     Log.e(
                                             TAG,
-                                            "Crash report failed",
+                                            "Crash report HTTP failed",
                                             e
                                     );
                                 }
+
                                 @Override
                                 public void onResponse(
                                         okhttp3.Call call,
                                         Response response
                                 ) {
-                                    Log.i(
-                                            TAG,
-                                            "Crash report sent: "
-                                                    + response.code()
-                                    );
-                                    response.close();
+
+                                    try {
+
+                                        Log.i(
+                                                TAG,
+                                                "Crash report HTTP response: "
+                                                        + response.code()
+                                        );
+
+                                        if (response.isSuccessful()) {
+
+                                            Log.i(
+                                                    TAG,
+                                                    "Crash report sent successfully"
+                                            );
+
+                                        } else {
+
+                                            Log.e(
+                                                    TAG,
+                                                    "Crash report server returned HTTP "
+                                                            + response.code()
+                                            );
+                                        }
+
+                                    } finally {
+
+                                        response.close();
+                                    }
                                 }
                             }
                     );
+
         } catch (Throwable e) {
+
             Log.e(
                     TAG,
                     "sendCrashReport failed",
@@ -907,10 +1109,16 @@ public class MirrorService extends Service {
             );
         }
     }
+
+    // ============================================================
+    // Error
+    // ============================================================
+
     private void saveError(
             String title,
             Throwable e
     ) {
+
         String message =
                 title
                         + "\n\n"
@@ -920,13 +1128,14 @@ public class MirrorService extends Service {
                         + String.valueOf(
                                 e.getMessage()
                         );
-        saveError(
-                message
-        );
+
+        saveError(message);
     }
+
     private void saveError(
             String message
     ) {
+
         getSharedPreferences(
                 DEBUG_PREFS,
                 MODE_PRIVATE
@@ -938,10 +1147,17 @@ public class MirrorService extends Service {
                 )
                 .apply();
     }
+
+    // ============================================================
+    // WebSocket
+    // ============================================================
+
     private void connectSignaling() {
+
         setStage(
                 "websocket:create_url"
         );
+
         String wsUrl =
                 serverUrl
                         .replaceFirst(
@@ -952,70 +1168,81 @@ public class MirrorService extends Service {
                                 "^http://",
                                 "ws://"
                         );
+
         Log.i(
                 TAG,
                 "WebSocket URL: "
                         + wsUrl
         );
+
         Request request =
                 new Request.Builder()
                         .url(wsUrl)
                         .build();
+
         httpClient =
                 new OkHttpClient.Builder()
                         .build();
+
         setStage(
                 "websocket:connect"
         );
+
         socket =
                 httpClient.newWebSocket(
                         request,
                         new WebSocketListener() {
+
                             @Override
                             public void onOpen(
                                     WebSocket webSocket,
                                     Response response
                             ) {
+
                                 setStage(
                                         "websocket:onOpen"
                                 );
+
                                 try {
+
                                     JSONObject join =
                                             new JSONObject();
+
                                     join.put(
                                             "type",
                                             "join"
                                     );
+
                                     join.put(
                                             "room",
                                             room
                                     );
+
                                     join.put(
                                             "role",
                                             "broadcaster"
                                     );
+
                                     setStage(
                                             "websocket:send_join"
                                     );
-                                    boolean sent =
-                                            webSocket.send(
-                                                    join.toString()
-                                            );
-                                    Log.i(
-                                            TAG,
-                                            "join send returned: "
-                                                    + sent
+
+                                    webSocket.send(
+                                            join.toString()
                                     );
+
                                     setStage(
-                                            "websocket:join_sent:"
-                                                    + sent
+                                            "websocket:join_sent"
                                     );
+
                                 } catch (Throwable e) {
+
                                     Log.e(
                                             TAG,
                                             "join error",
                                             e
                                     );
+
                                     sendCrashReport(
                                             serverUrl,
                                             room,
@@ -1025,58 +1252,60 @@ public class MirrorService extends Service {
                                     );
                                 }
                             }
+
                             @Override
                             public void onMessage(
                                     WebSocket webSocket,
                                     String text
                             ) {
+
                                 Log.i(
                                         TAG,
                                         "WebSocket message: "
                                                 + text
                                 );
-                                handleSignal(
-                                        text
-                                );
+
+                                handleSignal(text);
                             }
+
                             @Override
                             public void onFailure(
                                     WebSocket webSocket,
                                     Throwable t,
                                     Response response
                             ) {
+
                                 Log.e(
                                         TAG,
                                         "WebSocket failure",
                                         t
                                 );
+
                                 setStage(
                                         "websocket:failure"
                                 );
+
                                 updateNotification(
                                         "WebSocket接続エラー"
                                 );
                             }
+
                             @Override
                             public void onClosed(
                                     WebSocket webSocket,
                                     int code,
                                     String reason
                             ) {
+
                                 Log.i(
                                         TAG,
                                         "WebSocket closed: "
-                                                + code
-                                                + " / "
                                                 + reason
                                 );
+
                                 /*
                                  * WebSocketが閉じただけでは
-                                 * Androidプロセスが終了したとは
-                                 * 判断しない。
-                                 *
-                                 * session_active /
-                                 * clean_stop は変更しない。
+                                 * Androidプロセスの異常終了ではない。
                                  */
                                 setStage(
                                         "websocket:closed"
@@ -1085,53 +1314,87 @@ public class MirrorService extends Service {
                         }
                 );
     }
+
+    // ============================================================
+    // Signaling
+    // ============================================================
+
     private void handleSignal(
             String text
     ) {
+
         try {
+
             JSONObject msg =
                     new JSONObject(text);
+
             String type =
                     msg.optString(
                             "type"
                     );
+
             Log.i(
                     TAG,
                     "Signal type: "
                             + type
             );
+
+            // ----------------------------------------------------
+            // hello
+            // ----------------------------------------------------
+
             if ("hello".equals(type)) {
+
                 clientId =
                         msg.optString(
                                 "clientId"
                         );
+
                 setStage(
                         "signal:hello"
                 );
+
                 return;
             }
+
+            // ----------------------------------------------------
+            // joined
+            // ----------------------------------------------------
+
             if ("joined".equals(type)) {
+
                 setStage(
                         "signal:joined"
                 );
+
                 updateNotification(
                         "待機中 • ルーム "
                                 + room
                 );
+
                 return;
             }
+
+            // ----------------------------------------------------
+            // peer-joined
+            // ----------------------------------------------------
+
             if ("peer-joined".equals(type)) {
+
                 setStage(
                         "signal:peer_joined"
                 );
+
                 String peerId =
                         msg.optString(
                                 "peerId"
                         );
+
                 String peerRole =
                         msg.optString(
                                 "role"
                         );
+
                 Log.i(
                         TAG,
                         "Peer joined: "
@@ -1139,53 +1402,75 @@ public class MirrorService extends Service {
                                 + " role="
                                 + peerRole
                 );
+
                 if ("viewer".equals(
                         peerRole
                 )
                         && !peerId.isEmpty()) {
+
                     setStage(
                             "peer:create_requested"
                     );
+
                     PeerConnection pc =
                             createPeer(
                                     peerId
                             );
+
                     if (pc != null) {
+
                         setStage(
                                 "peer:create_success"
                         );
+
                         createOffer(
                                 peerId,
                                 pc
                         );
+
                     } else {
+
                         Log.e(
                                 TAG,
                                 "createPeer returned null"
                         );
+
                         setStage(
                                 "peer:create_null"
                         );
                     }
                 }
+
                 return;
             }
+
+            // ----------------------------------------------------
+            // answer
+            // ----------------------------------------------------
+
             if ("answer".equals(type)) {
+
                 setStage(
                         "signal:answer"
                 );
+
                 String from =
                         msg.optString(
                                 "from"
                         );
+
                 PeerConnection pc =
                         peers.get(from);
+
                 if (pc != null) {
+
                     JSONObject sdp =
                             msg.optJSONObject(
                                     "data"
                             );
+
                     if (sdp != null) {
+
                         SessionDescription answer =
                                 new SessionDescription(
                                         SessionDescription
@@ -1195,36 +1480,51 @@ public class MirrorService extends Service {
                                                 "sdp"
                                         )
                                 );
+
                         setStage(
                                 "answer:setRemoteDescription"
                         );
+
                         pc.setRemoteDescription(
                                 new SimpleSdpObserver(),
                                 answer
                         );
+
                         setStage(
                                 "answer:setRemoteDescription:called"
                         );
                     }
                 }
+
                 return;
             }
+
+            // ----------------------------------------------------
+            // candidate
+            // ----------------------------------------------------
+
             if ("candidate".equals(type)) {
+
                 setStage(
                         "signal:candidate"
                 );
+
                 String from =
                         msg.optString(
                                 "from"
                         );
+
                 PeerConnection pc =
                         peers.get(from);
+
                 JSONObject c =
                         msg.optJSONObject(
                                 "data"
                         );
+
                 if (pc != null
                         && c != null) {
+
                     IceCandidate candidate =
                             new IceCandidate(
                                     c.optString(
@@ -1237,23 +1537,29 @@ public class MirrorService extends Service {
                                             "candidate"
                                     )
                             );
+
                     setStage(
                             "candidate:addIceCandidate"
                     );
+
                     pc.addIceCandidate(
                             candidate
                     );
+
                     setStage(
                             "candidate:addIceCandidate:called"
                     );
                 }
             }
+
         } catch (Throwable e) {
+
             Log.e(
                     TAG,
                     "Signal parse error",
                     e
             );
+
             sendCrashReport(
                     serverUrl,
                     room,
@@ -1263,34 +1569,50 @@ public class MirrorService extends Service {
             );
         }
     }
+
+    // ============================================================
+    // PeerConnection
+    // ============================================================
+
     private PeerConnection createPeer(
             String peerId
     ) {
+
         setStage(
                 "peer:create:start"
         );
+
         PeerConnection existing =
                 peers.get(peerId);
+
         if (existing != null) {
+
             setStage(
                     "peer:create:existing"
             );
+
             return existing;
         }
+
         if (factory == null
                 || screenTrack == null) {
+
             Log.e(
                     TAG,
                     "WebRTC resources are not ready"
             );
+
             setStage(
                     "peer:create:resources_not_ready"
             );
+
             return null;
         }
+
         List<PeerConnection.IceServer>
                 iceServers =
                 new ArrayList<>();
+
         iceServers.add(
                 PeerConnection.IceServer
                         .builder(
@@ -1298,24 +1620,30 @@ public class MirrorService extends Service {
                         )
                         .createIceServer()
         );
+
         setStage(
                 "peer:ice_servers_created"
         );
+
         PeerConnection.RTCConfiguration config =
                 new PeerConnection.RTCConfiguration(
                         iceServers
                 );
+
         setStage(
                 "peer:createPeerConnection:start"
         );
+
         PeerConnection pc =
                 factory.createPeerConnection(
                         config,
                         new PeerConnection.Observer() {
+
                             @Override
                             public void onSignalingChange(
                                     PeerConnection.SignalingState state
                             ) {
+
                                 Log.i(
                                         TAG,
                                         "Signaling state "
@@ -1324,10 +1652,12 @@ public class MirrorService extends Service {
                                                 + state
                                 );
                             }
+
                             @Override
                             public void onIceConnectionChange(
                                     PeerConnection.IceConnectionState state
                             ) {
+
                                 Log.i(
                                         TAG,
                                         "ICE "
@@ -1336,15 +1666,17 @@ public class MirrorService extends Service {
                                                 + state
                                 );
                             }
+
                             @Override
                             public void onIceConnectionReceivingChange(
                                     boolean receiving
-                            ) {
-                            }
+                            ) {}
+
                             @Override
                             public void onIceGatheringChange(
                                     PeerConnection.IceGatheringState state
                             ) {
+
                                 Log.i(
                                         TAG,
                                         "ICE gathering "
@@ -1353,132 +1685,167 @@ public class MirrorService extends Service {
                                                 + state
                                 );
                             }
+
                             @Override
                             public void onIceCandidate(
                                     IceCandidate candidate
                             ) {
+
                                 sendCandidate(
                                         peerId,
                                         candidate
                                 );
                             }
+
                             @Override
                             public void onIceCandidatesRemoved(
                                     IceCandidate[] candidates
-                            ) {
-                            }
+                            ) {}
+
                             @Override
                             public void onAddStream(
                                     org.webrtc.MediaStream stream
-                            ) {
-                            }
+                            ) {}
+
                             @Override
                             public void onRemoveStream(
                                     org.webrtc.MediaStream stream
-                            ) {
-                            }
+                            ) {}
+
                             @Override
                             public void onDataChannel(
                                     DataChannel dataChannel
-                            ) {
-                            }
+                            ) {}
+
                             @Override
                             public void onRenegotiationNeeded() {
+
                                 Log.i(
                                         TAG,
                                         "Renegotiation needed: "
                                                 + peerId
                                 );
                             }
+
                             @Override
                             public void onAddTrack(
                                     RtpReceiver receiver,
                                     org.webrtc.MediaStream[] streams
-                            ) {
-                            }
+                            ) {}
                         }
                 );
+
         setStage(
                 "peer:createPeerConnection:returned"
         );
+
         if (pc != null) {
+
             /*
-             * Viewer接続時の重要箇所。
+             * 重要な調査ポイント。
+             *
+             * Viewer接続時に
+             * addTrack()付近で落ちるか確認する。
              */
             setStage(
                     "peer:addTrack:start"
             );
+
             pc.addTrack(
                     screenTrack
             );
+
             setStage(
                     "peer:addTrack:success"
             );
+
             peers.put(
                     peerId,
                     pc
             );
+
             setStage(
                     "peer:stored"
             );
         }
+
         return pc;
     }
+
+    // ============================================================
+    // Offer
+    // ============================================================
+
     private void createOffer(
             String peerId,
             PeerConnection pc
     ) {
+
         setStage(
                 "offer:create:start"
         );
+
         MediaConstraints constraints =
                 new MediaConstraints();
+
         constraints.mandatory.add(
                 new MediaConstraints.KeyValuePair(
                         "OfferToReceiveAudio",
                         "false"
                 )
         );
+
         constraints.mandatory.add(
                 new MediaConstraints.KeyValuePair(
                         "OfferToReceiveVideo",
                         "false"
                 )
         );
+
         setStage(
                 "offer:createOffer:call"
         );
+
         pc.createOffer(
                 new SdpObserver() {
+
                     @Override
                     public void onCreateSuccess(
                             SessionDescription sdp
                     ) {
+
                         setStage(
                                 "offer:create:success"
                         );
+
                         pc.setLocalDescription(
                                 new SimpleSdpObserver() {
+
                                     @Override
                                     public void onSetSuccess() {
+
                                         setStage(
                                                 "offer:setLocalDescription:success"
                                         );
+
                                         sendSdp(
                                                 "offer",
                                                 peerId,
                                                 sdp
                                         );
                                     }
+
                                     @Override
                                     public void onSetFailure(
                                             String error
                                     ) {
+
                                         Log.e(
                                                 TAG,
                                                 "setLocalDescription failed: "
                                                         + error
                                         );
+
                                         setStage(
                                                 "offer:setLocalDescription:failure"
                                         );
@@ -1486,35 +1853,42 @@ public class MirrorService extends Service {
                                 },
                                 sdp
                         );
+
                         setStage(
                                 "offer:setLocalDescription:called"
                         );
                     }
+
                     @Override
-                    public void onSetSuccess() {
-                    }
+                    public void onSetSuccess() {}
+
                     @Override
                     public void onCreateFailure(
                             String error
                     ) {
+
                         Log.e(
                                 TAG,
                                 "Offer create failed: "
                                         + error
                         );
+
                         setStage(
                                 "offer:create:failure"
                         );
                     }
+
                     @Override
                     public void onSetFailure(
                             String error
                     ) {
+
                         Log.e(
                                 TAG,
                                 "Offer set failure: "
                                         + error
                         );
+
                         setStage(
                                 "offer:set:failure"
                         );
@@ -1523,50 +1897,68 @@ public class MirrorService extends Service {
                 constraints
         );
     }
+
+    // ============================================================
+    // SDP
+    // ============================================================
+
     private void sendSdp(
             String type,
             String to,
             SessionDescription sdp
     ) {
+
         try {
+
             JSONObject data =
                     new JSONObject();
+
             data.put(
                     "type",
                     sdp.type.canonicalForm()
             );
+
             data.put(
                     "sdp",
                     sdp.description
             );
+
             JSONObject msg =
                     new JSONObject();
+
             msg.put(
                     "type",
                     type
             );
+
             msg.put(
                     "to",
                     to
             );
+
             msg.put(
                     "data",
                     data
             );
+
             if (socket != null) {
+
                 /*
                  * SDP送信直前
                  */
                 setStage(
                         "sdp:send:start"
                 );
+
                 String message =
                         msg.toString();
+
                 Log.i(
                         TAG,
                         "Sending SDP length="
                                 + message.length()
                 );
+
                 /*
                  * WebSocket送信
                  */
@@ -1574,6 +1966,7 @@ public class MirrorService extends Service {
                         socket.send(
                                 message
                         );
+
                 /*
                  * socket.send()から戻ったか確認
                  */
@@ -1582,25 +1975,21 @@ public class MirrorService extends Service {
                         "socket.send returned: "
                                 + sent
                 );
+
                 setStage(
                         "sdp:send:returned:"
                                 + sent
                 );
-            } else {
-                Log.w(
-                        TAG,
-                        "sendSdp: socket is null"
-                );
-                setStage(
-                        "sdp:send:socket_null"
-                );
             }
+
         } catch (Throwable e) {
+
             Log.e(
                     TAG,
                     "sendSdp error",
                     e
             );
+
             sendCrashReport(
                     serverUrl,
                     room,
@@ -1610,59 +1999,80 @@ public class MirrorService extends Service {
             );
         }
     }
+
+    // ============================================================
+    // Candidate
+    // ============================================================
+
     private void sendCandidate(
             String to,
             IceCandidate candidate
     ) {
+
         try {
+
             JSONObject data =
                     new JSONObject();
+
             data.put(
                     "candidate",
                     candidate.sdp
             );
+
             data.put(
                     "sdpMid",
                     candidate.sdpMid
             );
+
             data.put(
                     "sdpMLineIndex",
                     candidate.sdpMLineIndex
             );
+
             JSONObject msg =
                     new JSONObject();
+
             msg.put(
                     "type",
                     "candidate"
             );
+
             msg.put(
                     "to",
                     to
             );
+
             msg.put(
                     "data",
                     data
             );
+
             if (socket != null) {
+
                 setStage(
                         "candidate:send"
                 );
+
                 boolean sent =
                         socket.send(
                                 msg.toString()
                         );
+
                 Log.i(
                         TAG,
-                        "candidate send returned: "
+                        "Candidate socket.send returned: "
                                 + sent
                 );
             }
+
         } catch (Throwable e) {
+
             Log.e(
                     TAG,
                     "sendCandidate error",
                     e
             );
+
             sendCrashReport(
                     serverUrl,
                     room,
@@ -1672,120 +2082,189 @@ public class MirrorService extends Service {
             );
         }
     }
-    private void stopMirror() {
+
+    // ============================================================
+    // Stop / cleanup
+    // ============================================================
+
+    private synchronized void stopMirror() {
+
+        if (stopping) {
+
+            Log.i(
+                    TAG,
+                    "stopMirror already running"
+            );
+
+            return;
+        }
+
+        stopping = true;
+
         setStage(
                 "stop:start"
         );
+
         try {
-            /*
-             * PeerConnection
-             */
+
+            // ----------------------------------------------------
+            // PeerConnections
+            // ----------------------------------------------------
+
             for (
                     PeerConnection pc :
                     peers.values()
             ) {
+
                 try {
+
                     pc.close();
-                } catch (Throwable ignored) {
-                }
+
+                } catch (Throwable ignored) {}
             }
+
             peers.clear();
-            /*
-             * WebSocket
-             */
+
+            // ----------------------------------------------------
+            // WebSocket
+            // ----------------------------------------------------
+
             if (socket != null) {
+
                 try {
+
                     socket.close(
                             1000,
                             "stopped"
                     );
-                } catch (Throwable ignored) {
-                }
+
+                } catch (Throwable ignored) {}
+
                 socket = null;
             }
-            /*
-             * Capturer
-             */
+
+            // ----------------------------------------------------
+            // Capturer
+            // ----------------------------------------------------
+
             if (capturer != null) {
+
                 try {
+
                     capturer.stopCapture();
-                } catch (Throwable ignored) {
-                }
+
+                } catch (Throwable ignored) {}
+
                 try {
+
                     capturer.dispose();
-                } catch (Throwable ignored) {
-                }
+
+                } catch (Throwable ignored) {}
+
                 capturer = null;
             }
-            /*
-             * VideoSource
-             */
+
+            // ----------------------------------------------------
+            // VideoSource
+            // ----------------------------------------------------
+
             if (videoSource != null) {
+
                 try {
+
                     videoSource.dispose();
-                } catch (Throwable ignored) {
-                }
+
+                } catch (Throwable ignored) {}
+
                 videoSource = null;
             }
-            /*
-             * VideoTrack
-             */
+
+            // ----------------------------------------------------
+            // VideoTrack
+            // ----------------------------------------------------
+
             if (screenTrack != null) {
+
                 try {
+
                     screenTrack.dispose();
-                } catch (Throwable ignored) {
-                }
+
+                } catch (Throwable ignored) {}
+
                 screenTrack = null;
             }
-            /*
-             * SurfaceTextureHelper
-             */
+
+            // ----------------------------------------------------
+            // SurfaceTextureHelper
+            // ----------------------------------------------------
+
             if (surfaceTextureHelper != null) {
+
                 try {
+
                     surfaceTextureHelper.dispose();
-                } catch (Throwable ignored) {
-                }
+
+                } catch (Throwable ignored) {}
+
                 surfaceTextureHelper = null;
             }
-            /*
-             * PeerConnectionFactory
-             */
+
+            // ----------------------------------------------------
+            // PeerConnectionFactory
+            // ----------------------------------------------------
+
             if (factory != null) {
+
                 try {
+
                     factory.dispose();
-                } catch (Throwable ignored) {
-                }
+
+                } catch (Throwable ignored) {}
+
                 factory = null;
             }
-            /*
-             * EGL
-             */
+
+            // ----------------------------------------------------
+            // EGL
+            // ----------------------------------------------------
+
             if (eglBase != null) {
+
                 try {
+
                     eglBase.release();
-                } catch (Throwable ignored) {
-                }
+
+                } catch (Throwable ignored) {}
+
                 eglBase = null;
             }
-            /*
-             * HTTP client
-             */
+
+            // ----------------------------------------------------
+            // HTTP client
+            // ----------------------------------------------------
+
             if (httpClient != null) {
+
                 try {
+
                     httpClient
                             .dispatcher()
                             .executorService()
                             .shutdown();
-                } catch (Throwable ignored) {
-                }
+
+                } catch (Throwable ignored) {}
+
                 httpClient = null;
             }
+
         } catch (Throwable e) {
+
             Log.e(
                     TAG,
                     "stopMirror error",
                     e
             );
+
             sendCrashReport(
                     serverUrl,
                     room,
@@ -1793,25 +2272,49 @@ public class MirrorService extends Service {
                     e,
                     getCurrentStage()
             );
+
         } finally {
+
             /*
-             * stopMirror()まで到達した場合、
-             * 正常なリソース解放処理として扱う。
+             * stopMirror()まで到達した場合は、
+             * セッションを終了状態にする。
              */
             markCleanStop();
-            setStage(
-                    "normal_stop"
+
+            getSharedPreferences(
+                    DEBUG_PREFS,
+                    MODE_PRIVATE
+            )
+                    .edit()
+                    .putString(
+                            KEY_STAGE,
+                            "normal_stop"
+                    )
+                    .apply();
+
+            Log.i(
+                    TAG,
+                    "Mirror stopped normally"
             );
+
+            stopping = false;
         }
     }
+
+    // ============================================================
+    // Notification
+    // ============================================================
+
     private Notification buildNotification(
             String text
     ) {
+
         Intent intent =
                 new Intent(
                         this,
                         MainActivity.class
                 );
+
         PendingIntent pi =
                 PendingIntent.getActivity(
                         this,
@@ -1820,6 +2323,7 @@ public class MirrorService extends Service {
                         PendingIntent.FLAG_UPDATE_CURRENT
                                 | PendingIntent.FLAG_IMMUTABLE
                 );
+
         return new NotificationCompat.Builder(
                 this,
                 CHANNEL_ID
@@ -1843,25 +2347,30 @@ public class MirrorService extends Service {
                 )
                 .build();
     }
+
     private void updateNotification(
             String text
     ) {
+
         NotificationManager manager =
                 getSystemService(
                         NotificationManager.class
                 );
+
         if (manager != null) {
+
             manager.notify(
                     NOTIFICATION_ID,
-                    buildNotification(
-                            text
-                    )
+                    buildNotification(text)
             );
         }
     }
+
     private void createNotificationChannel() {
+
         if (Build.VERSION.SDK_INT >=
                 Build.VERSION_CODES.O) {
+
             NotificationChannel channel =
                     new NotificationChannel(
                             CHANNEL_ID,
@@ -1869,34 +2378,48 @@ public class MirrorService extends Service {
                             NotificationManager
                                     .IMPORTANCE_LOW
                     );
+
             channel.setDescription(
                     "画面共有中の通知"
             );
+
             NotificationManager manager =
                     getSystemService(
                             NotificationManager.class
                     );
+
             if (manager != null) {
+
                 manager.createNotificationChannel(
                         channel
                 );
             }
         }
     }
+
+    // ============================================================
+    // Destroy
+    // ============================================================
+
     @Override
     public void onDestroy() {
+
         Log.i(
                 TAG,
-                "MirrorService onDestroy"
+                "Service onDestroy"
         );
+
         /*
-         * AndroidからServiceが正常に破棄された場合も
-         * 明示的な終了として扱う。
+         * onDestroy()まで来た場合は、
+         * AndroidからServiceが正常に破棄されたと判断する。
          */
         markCleanStop();
+
         stopMirror();
+
         super.onDestroy();
     }
+
     @Nullable
     @Override
     public IBinder onBind(
@@ -1904,26 +2427,31 @@ public class MirrorService extends Service {
     ) {
         return null;
     }
+
+    // ============================================================
+    // SDP Observer
+    // ============================================================
+
     private static class SimpleSdpObserver
             implements SdpObserver {
+
         @Override
         public void onCreateSuccess(
                 SessionDescription sdp
-        ) {
-        }
+        ) {}
+
         @Override
-        public void onSetSuccess()
-        {
-        }
+        public void onSetSuccess() {}
+
         @Override
         public void onCreateFailure(
                 String error
-        ) {
-        }
+        ) {}
+
         @Override
         public void onSetFailure(
                 String error
-        ) {
-        }
+        ) {}
     }
 }
+:::
